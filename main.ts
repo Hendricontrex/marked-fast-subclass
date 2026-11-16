@@ -1,22 +1,26 @@
-// main.ts — driver: read the cases, render each one alone, write the HTML.
-//
-// The harness runs this as `node /bot/main.ts`. Cases come from
-// $MAKEFUN_INPUT_DIR/cases.json (default /input); the rendered HTML goes
-// to $MAKEFUN_OUTPUT_DIR/html.json (default /output), one string per case,
-// in order. Every case is rendered on its own, exactly as the scorer
-// expects, so no state is shared between cases.
+// Entry point the harness runs as `node /bot/main.ts` (Node 22 strips the
+// types). It reads every case from /input/cases.json (or
+// MAKEFUN_INPUT_DIR), renders each one with parse() from parse.js, and
+// writes the HTML strings, in the cases' order, to /output/html.json
+// (or MAKEFUN_OUTPUT_DIR).
 
-import * as fs from 'node:fs';
-import { parse as renderMarkdown } from './parse.js';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse } from './parse.js';
 
-type CaseDoc = { markdown: string };
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+type Case = { id: string; markdown: string };
 
-const payload = fs.readFileSync(`${inDir}/cases.json`, 'utf8');
-const docs: CaseDoc[] = JSON.parse(payload);
-const rendered = docs.map((doc) => renderMarkdown(doc.markdown));
+const cases = JSON.parse(
+  readFileSync(join(inputDir, 'cases.json'), 'utf8'),
+) as Case[];
 
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(`${outDir}/html.json`, JSON.stringify(rendered));
+const rendered = new Array<string>(cases.length);
+for (let i = 0; i < cases.length; i++) {
+  rendered[i] = parse(cases[i].markdown);
+}
+
+mkdirSync(outputDir, { recursive: true });
+writeFileSync(join(outputDir, 'html.json'), JSON.stringify(rendered));
