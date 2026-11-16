@@ -24,6 +24,23 @@ function firstLine(s) {
   return nl === -1 ? s : s.slice(0, nl);
 }
 
+// First character of `s` that is not a space, or -1 when there is none.
+function firstNonSpaceCh(s) {
+  let i = 0;
+  while (i < s.length && s.charCodeAt(i) === 32) i++;
+  return i < s.length ? s.charCodeAt(i) : -1;
+}
+
+// Whether a line whose first non-space character is `c` could start a
+// block construct: a fence (` or ~), a heading (#), raw HTML (<), a
+// blockquote (>), a list bullet (*, -, + or a digit) or a thematic
+// break (-, _ or *).
+function canStartBlock(c) {
+  return c === 96 || c === 126 || c === 35 || c === 60 || c === 62 ||
+    c === 42 || c === 45 || c === 43 || c === 95 ||
+    (c >= 48 && c <= 57);
+}
+
 // A fast list tokenizer: same tokens as marked's Tokenizer.list, but the
 // line scan walks the string with indexOf instead of splitting it, and the
 // item text is built with plain string appends.
@@ -91,6 +108,7 @@ export class FastTokenizer extends Tokenizer {
         const htmlRe = other.htmlBeginRegex(indent);
         const bqRe = other.blockquoteBeginRegex(indent);
         let cur = body;
+        let curCanStart = canStartBlock(firstNonSpaceCh(cur));
         while (rest) {
           const nl = rest.indexOf('\n');
           const line = nl === -1 ? rest : rest.slice(0, nl);
@@ -100,30 +118,48 @@ export class FastTokenizer extends Tokenizer {
             next = next.replace(other.listReplaceNesting, '  ');
             expanded = next;
           } else {
-            expanded = next.replace(other.leadingSpaceTab, (v) => expandTabs(v));
+            const c0 = next.charCodeAt(0);
+            expanded = (c0 === 32 || c0 === 9)
+              ? next.replace(other.leadingSpaceTab, (v) => expandTabs(v))
+              : next;
           }
+          // First non-space character of the expanded line, found by hand:
+          // every block-construct regex below starts with spaces and then
+          // one of the canStartBlock characters, so when the line starts
+          // with anything else none of them can match and all six tests
+          // are skipped. `p` is also the value marked's nonSpaceChar
+          // search would return.
+          let p = 0;
+          while (p < expanded.length && expanded.charCodeAt(p) === 32) p++;
+          if (p === expanded.length) p = -1;
+          const firstCh = p === -1 ? -1 : expanded.charCodeAt(p);
+          const blank = !next.trim();
           if (
-            fenceRe.test(next) || headRe.test(next) || htmlRe.test(next) ||
-            bqRe.test(next) || nextBullet.test(next) || hrRe.test(next)
+            canStartBlock(firstCh) &&
+            (fenceRe.test(next) || headRe.test(next) || htmlRe.test(next) ||
+              bqRe.test(next) || nextBullet.test(next) || hrRe.test(next))
           ) break;
-          if (expanded.search(other.nonSpaceChar) >= indent || !next.trim()) {
+          if (p >= indent || blank) {
             text += '\n' + expanded.slice(indent);
           } else {
             if (
               emptyFirst ||
               cur.replace(other.tabCharGlobal, '    ').search(other.nonSpaceChar) >= 4 ||
-              fenceRe.test(cur) || headRe.test(cur) || htmlRe.test(cur) || hrRe.test(cur)
+              (curCanStart &&
+                (fenceRe.test(cur) || headRe.test(cur) || htmlRe.test(cur) || hrRe.test(cur)))
             ) break;
             const setext = !this.options.pedantic &&
+              (firstCh === 61 || firstCh === 45) &&
               /^ {0,3}(?:=+|-+) *$/.test(next) &&
               block.lheading.test(`${cur}\n${next}`)
               ? `    ${expanded.replace(/^ {0,3}/, '')}`
               : next;
             text += '\n' + setext;
           }
-          emptyFirst = !next.trim();
+          emptyFirst = blank;
           rest = nl === -1 ? '' : rest.substring(nl + 1);
           cur = expanded.slice(indent);
+          curCanStart = canStartBlock(firstNonSpaceCh(cur));
         }
       }
       const raw = src.slice(itemStart, used());
@@ -223,13 +259,12 @@ export class FastTokenizer extends Tokenizer {
 
   // Inline rules below: each one bails out fast when the first character
   // cannot start its construct, so the dispatch never pays for a regex
-  // that cannot match. Every guard is exact: a construct's regex can only
-  // match when the guard passes.
-  escape(src) {
-    if (src.charCodeAt(0) !== 92) return; // backslash
-    return super.escape(src);
-  }
-
+  // that cannot match. Only the rules whose regex is expensive even on
+  // failure are guarded: escape, br and autolink fail fast on their first
+  // literal, so an override would cost more than it saves. emStrong and
+  // del are deliberately NOT overridden: overriding either switches on
+  // marked's emphasis-mask scan for every inline string, which costs
+  // more than the guards save.
   tag(src) {
     if (src.charCodeAt(0) !== 60) return; // <
     return super.tag(src);
@@ -247,31 +282,9 @@ export class FastTokenizer extends Tokenizer {
     return super.reflink(src, links);
   }
 
-  emStrong(src, prevChar, state) {
-    const c = src.charCodeAt(0);
-    if (c !== 42 && c !== 95) return; // * or _
-    return super.emStrong(src, prevChar, state);
-  }
-
   codespan(src) {
     if (src.charCodeAt(0) !== 96) return; // backtick
     return super.codespan(src);
-  }
-
-  br(src) {
-    const c = src.charCodeAt(0);
-    if (c !== 32 && c !== 92) return; // space or backslash
-    return super.br(src);
-  }
-
-  del(src, prevChar, state) {
-    if (src.charCodeAt(0) !== 126) return; // ~
-    return super.del(src, prevChar, state);
-  }
-
-  autolink(src) {
-    if (src.charCodeAt(0) !== 60) return; // <
-    return super.autolink(src);
   }
 
   url(src) {
