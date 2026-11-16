@@ -9,10 +9,23 @@
 import { Lexer, Parser, getDefaults } from './vendor/marked/marked.esm.js';
 import { FastTokenizer } from './src/OptimizedTokenizer.js';
 
+// One lexer/parser pair, reused across cases. Building a fresh tokenizer,
+// lexer, and parser per case is pure overhead: the lexer holds no state
+// between documents once its token list, link table, inline queue, and
+// flags are cleared, and the parser is stateless given its tokens.
+const options = { ...getDefaults(), gfm: true };
+const fast = new FastTokenizer(options);
+options.tokenizer = fast;
+const lexer = new Lexer(options);
+const parser = new Parser(options);
+
 export function parse(markdown) {
-  const options = { ...getDefaults(), gfm: true };
-  const fast = new FastTokenizer(options);
-  options.tokenizer = fast;
-  const tokens = new Lexer(options).lex(markdown);
-  return new Parser(options).parse(tokens);
+  lexer.tokens.length = 0;
+  lexer.tokens.links = Object.create(null);
+  lexer.inlineQueue.length = 0;
+  lexer.state.inLink = false;
+  lexer.state.inRawBlock = false;
+  lexer.state.top = true;
+  const tokens = lexer.lex(markdown);
+  return parser.parse(tokens);
 }
