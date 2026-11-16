@@ -1,18 +1,18 @@
-// Optimized drop-in for marked 18.1.3: parse(markdown) returns exactly the
-// HTML marked renders with its defaults (GFM on, async off), faster.
-// The marked library is vendored untouched (vendor/marked/marked.esm.js);
-// speed comes from OptimizedTokenizer (src/OptimizedTokenizer.js), a
-// subclass that overrides list() with one combined "end of item" regex per
-// line plus indexOf() line ends, and guards the inline methods with a
-// first-character check so rules that cannot match are skipped.
-import { Marked } from './vendor/marked/marked.esm.js';
-import { OptimizedTokenizer } from './src/OptimizedTokenizer.js';
+// parse.js — render one Markdown document to HTML with the fast tokenizer.
+//
+// The public entry point for this entry: parse(markdown) returns exactly
+// what marked 18.1.3 renders with its default options (GFM on). The only
+// difference from stock marked is the tokenizer, which is a subclass with
+// a faster list rule and first-character guards on the inline rules. The
+// lexer and parser are marked's own, so the output is byte-identical.
 
-const tokenizer = new OptimizedTokenizer();
-const marked = new Marked();
-marked.setOptions({ tokenizer });
+import { Lexer, Parser, getDefaults } from './vendor/marked/marked.esm.js';
+import { FastTokenizer } from './src/OptimizedTokenizer.js';
 
-/** The HTML marked renders for `markdown`, with marked's defaults. */
 export function parse(markdown) {
-    return marked.parse(markdown);
+  const options = { ...getDefaults(), gfm: true };
+  const fast = new FastTokenizer(options);
+  options.tokenizer = fast;
+  const tokens = new Lexer(options).lex(markdown);
+  return new Parser(options).parse(tokens);
 }

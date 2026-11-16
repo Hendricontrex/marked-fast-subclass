@@ -1,18 +1,22 @@
-// The house baseline of markdown-render-speed-01, and a starter: marked 18.1.3 itself. The harness runs
-// `node /bot/main.ts` (node22). It reads every case from /input/cases.json (a JSON array of
-// {id, markdown}), renders each one alone with parse() from parse.js, and writes /output/html.json: a
-// JSON array of the HTML strings, one per case and in the cases' order. An entry keeps this driver and
-// replaces parse.js with a faster module whose parse(markdown) returns the same string marked does.
-// Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
+// main.ts — driver: read the cases, render each one alone, write the HTML.
+//
+// The harness runs this as `node /bot/main.ts`. Cases come from
+// $MAKEFUN_INPUT_DIR/cases.json (default /input); the rendered HTML goes
+// to $MAKEFUN_OUTPUT_DIR/html.json (default /output), one string per case,
+// in order. Every case is rendered on its own, exactly as the scorer
+// expects, so no state is shared between cases.
 
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { parse } from './parse.js';
+import * as fs from 'node:fs';
+import { parse as renderMarkdown } from './parse.js';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+type CaseDoc = { markdown: string };
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; markdown: string }[];
-const html: string[] = [];
-for (const c of cases) html.push(parse(c.markdown));
-writeFileSync(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
+const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+const payload = fs.readFileSync(`${inDir}/cases.json`, 'utf8');
+const docs: CaseDoc[] = JSON.parse(payload);
+const rendered = docs.map((doc) => renderMarkdown(doc.markdown));
+
+fs.mkdirSync(outDir, { recursive: true });
+fs.writeFileSync(`${outDir}/html.json`, JSON.stringify(rendered));

@@ -1,389 +1,535 @@
-// OptimizedTokenizer — a subclass of marked 18.1.3's Tokenizer (from the
-// vendored library in ../vendor/marked/marked.esm.js, used unchanged) with
-// two speed optimizations that keep output byte-identical:
+// A faster Tokenizer for marked 18.1.3.
 //
-//  1. list(): one combined "end of item" regex per line instead of six
-//     separate .test() calls, plus indexOf() instead of split() for line
-//     ends, so sliced strings are never flattened per line.
-//  2. Inline methods: a cheap first-character guard, so rules whose
-//     ^-anchored regex cannot match are skipped without running it.
+// Two ideas, both output-identical by construction:
+//  1. Inline rules are all anchored at the start of the remaining source, so
+//     each one can only match when the first character is one of a tiny set.
+//     We test that character first and skip the rule's pattern entirely when
+//     it cannot match. The parent method still does all real matching.
+//  2. Lists are scanned line by line with indexOf instead of being split,
+//     and the per-line "does this line end the current item" decision is one
+//     first-character dispatch instead of a run of separate rule tests.
 //
-// Everything here is written for this entry; the marked library itself is
-// vendored untouched and only subclassed.
+// Everything else is inherited from marked's Tokenizer unchanged.
+
 import { Tokenizer } from '../vendor/marked/marked.esm.js';
 
-// First line of `s` (up to the first \n, exclusive), without splitting:
-// split() flattens a sliced string, copying the whole remainder once per line.
-function firstLineOf(s) {
-    const i = s.indexOf('\n');
-    return i === -1 ? s : s.slice(0, i);
+// How many spaces may precede a block start (the block rules allow 0-3).
+const MAX_LEAD = 3;
+
+// Character codes used by the guards below.
+const CC = {
+  space: 32,
+  tab: 9,
+  bang: 33,
+  hash: 35,
+  star: 42,
+  plus: 43,
+  dash: 45,
+  dot: 46,
+  digit0: 48,
+  digit9: 57,
+  lt: 60,
+  backtick: 96,
+  tilde: 126,
+  underscore: 95,
+  backslash: 92,
+  bracket: 91,
+  gt: 62,
+  upperA: 65,
+  upperZ: 90,
+  lowerA: 97,
+  lowerZ: 122,
+  closeParen: 41,
+};
+
+export class FastTokenizer extends Tokenizer {
+
+  // --- inline rules: first-character guards, then the parent method ---
+
+  escape(src) {
+    return src.charCodeAt(0) === CC.backslash ? super.escape(src) : undefined;
+  }
+
+  tag(src) {
+    return src.charCodeAt(0) === CC.lt ? super.tag(src) : undefined;
+  }
+
+  link(src) {
+    const c = src.charCodeAt(0);
+    return c === CC.bracket || c === CC.bang ? super.link(src) : undefined;
+  }
+
+  reflink(src, links) {
+    const c = src.charCodeAt(0);
+    return c === CC.bracket || c === CC.bang
+      ? super.reflink(src, links)
+      : undefined;
+  }
+
+  emStrong(src, maskedSrc, prevChar) {
+    const c = src.charCodeAt(0);
+    return c === CC.star || c === CC.underscore
+      ? super.emStrong(src, maskedSrc, prevChar)
+      : undefined;
+  }
+
+  codespan(src) {
+    return src.charCodeAt(0) === CC.backtick
+      ? super.codespan(src)
+      : undefined;
+  }
+
+  br(src) {
+    const c = src.charCodeAt(0);
+    return c === CC.space || c === CC.backslash ? super.br(src) : undefined;
+  }
+
+  del(src, maskedSrc, prevChar) {
+    return src.charCodeAt(0) === CC.tilde
+      ? super.del(src, maskedSrc, prevChar)
+      : undefined;
+  }
+
+  autolink(src) {
+    return src.charCodeAt(0) === CC.lt ? super.autolink(src) : undefined;
+  }
+
+  url(src) {
+    // A bare link can only start with www., a scheme (http/https/ftp),
+    // mailto:/xmpp:, or an email address, so the first character must be a
+    // letter, a digit, or one of . _ + -.
+    const c = src.charCodeAt(0);
+    const ok =
+      (c >= CC.digit0 && c <= CC.digit9) ||
+      (c >= CC.upperA && c <= CC.upperZ) ||
+      (c >= CC.lowerA && c <= CC.lowerZ) ||
+      c === CC.dot ||
+      c === CC.underscore ||
+      c === CC.plus ||
+      c === CC.dash;
+    return ok ? super.url(src) : undefined;
+  }
+
+  // --- block rule: the fast list tokenizer ---
+  //
+  // marked's list rule only matches the first line of a list, so the rest
+  // is a line scan. We walk the source with indexOf, one line at a time,
+  // and decide per line whether it starts a new item, continues the current
+  // one (indented), continues it lazily, is a blank line, or ends the list.
+  // The per-line decision is a first-character dispatch (see interrupts()
+  // and blocksLazy() below), not a run of separate rule tests, and lines
+  // are never split: outdenting works on the line slice in place.
+  list(src) {
+    // The Lexer fills in this.rules only after construction, so the HTML
+    // block-start test is built on first use, from the html rule this
+    // Tokenizer already carries.
+    if (!this._htmlStart) this._htmlStart = buildHtmlStart(this.rules.block.html.source);
+    return scanList(this, src);
+  }
 }
 
-// Expand tabs to spaces, tracking the column from `indent` (tab stops of 4).
-function expandTabs(line, indent = 0) {
-    let col = indent;
-    let expanded = '';
-    for (const char of line) {
-        if (char === '\t') {
-            const added = 4 - (col % 4);
-            expanded += ' '.repeat(added);
-            col += added;
+// A setext underline is a run of = (any length) or exactly -- (--- and
+// longer are thematic breaks, a lone - is a bullet), with only spaces or
+// tabs after it. Left alone it would turn the paragraph above it into a
+// setext heading when the item text is lexed again, so a lazy one is
+// indented by four spaces to keep it plain text.
+function isSetextLine(line) {
+  if (line.length === 0) return false;
+  const c = line.charCodeAt(0);
+  let i = 0;
+  if (c === 61) {
+    while (i < line.length && line.charCodeAt(i) === 61) i++;
+  } else if (c === CC.dash) {
+    while (i < line.length && line.charCodeAt(i) === CC.dash) i++;
+    if (i !== 2) return false;
+  } else return false;
+  while (i < line.length) {
+    const d = line.charCodeAt(i);
+    if (d !== CC.space && d !== CC.tab) return false;
+    i++;
+  }
+  return true;
+}
+
+// A fence-looking line: 0-3 spaces then a run of 3+ backticks or tildes,
+// whatever follows. (The previous line blocks lazy continuation when it
+// looks like a fence, even when its info string holds a backtick and the
+// real fence rule would not call it one.)
+function fenceLike(line) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return false;
+  const ch = line.charCodeAt(i);
+  if (ch !== CC.backtick && ch !== CC.tilde) return false;
+  let j = i;
+  while (j < line.length && line.charCodeAt(j) === ch) j++;
+  return j - i >= 3;
+}
+
+// Build the HTML-block-start test from the html block rule's own source.
+// The one rule we cannot hand-roll cheaply is the HTML-block start: it
+// needs the CommonMark block-tag list. That list lives inside the html
+// block rule this Tokenizer already carries, so pull it out of the rule
+// instead of writing it down here.
+function buildHtmlStart(htmlSrc) {
+  const found = /<\\\/\?\(address\|([^)]*)\)/.exec(htmlSrc);
+  const tags = found ? found[1] : '';
+  const tagPart = tags
+    ? '<\\/?(?:' + tags + ')(?:[ \\t]|\\/?>|$)'
+    : '(?!)';
+  return new RegExp(
+    '^ {0,3}(?:' +
+      tagPart +
+      '|' +
+      '<(?:script|pre|style|textarea)(?:[\\s>]|$)' +
+      '|<!--|<\\?|<![A-Za-z]|<!\\[CDATA\\[' +
+      ')'
+  );
+}
+
+// ---------- the list scan ----------
+
+function scanList(tok, src) {
+  const cap = tok.rules.block.list.exec(src);
+  if (!cap) return undefined;
+  const htmlRe = tok._htmlStart;
+  const first = cap[1];
+  let bi = 0;
+  while (bi < first.length && first.charCodeAt(bi) === CC.space) bi++;
+  const bull = first.slice(bi);
+  const ordered = bull.length > 1;
+  const listDelim = ordered ? bull[bull.length - 1] : bull;
+  const start = ordered ? +bull.slice(0, -1) : '';
+  const fc = firstContent(bi, bull, cap[2] || '');
+
+  const items = [];
+  let curRaw = [cap[0]];
+  let curText = [fc.content];
+  let curW = fc.W;
+  let curHasContent = fc.content !== '';
+  let curPrevBlocks = false;
+  let curPrevIsBq = false;
+  let curPrevIsBull = false;
+  let pending = [];
+  let loose = false;
+  let blankPending = false;
+  const doubleBlank = tok.rules.other.doubleBlankLine;
+
+  // Per-content-line bookkeeping for the lazy rules and the setext pad.
+  // `out` is the line as it appears in the item text; `raw` is the line as
+  // it appears in the source.
+  function noteContent(out, raw) {
+    const rawLine = raw.charCodeAt(raw.length - 1) === 10 ? raw.slice(0, -1) : raw;
+    curPrevBlocks = blocksLazy(rawLine, htmlRe) || fenceLike(rawLine);
+    if (out !== '') curHasContent = true;
+    curPrevIsBq = /^ {0,3}>/.test(out);
+    curPrevIsBull = readBullet(out) !== null;
+  }
+
+  function closeItem(keepBlanks) {
+    if (keepBlanks && pending.length > 0) {
+      for (let k = 0; k < pending.length; k++) {
+        curRaw.push(pending[k]);
+        curText.push('');
+      }
+    }
+    pending.length = 0;
+    let task = false;
+    let checked;
+    const head = curText[0];
+    const m = /^\[([ xX])\][ \t]+/.exec(head);
+    if (m !== null && head.length > m[0].length) {
+      task = true;
+      checked = m[1] === 'x' || m[1] === 'X';
+      curText[0] = head.slice(m[0].length);
+    }
+    const item = { type: 'list_item', raw: curRaw.join(''), task, loose: false, text: curText.join('\n') };
+    if (task) item.checked = checked;
+    items.push(item);
+    // Loose, the parent's first way: an item whose raw ends with a blank
+    // line arms a flag, and the next item built while it is armed makes
+    // the whole list loose.
+    if (!loose) {
+      if (blankPending) loose = true;
+      else if (doubleBlank.test(item.raw)) blankPending = true;
+    }
+  }
+
+  // The first line's own bookkeeping.
+  noteContent(fc.content, cap[0]);
+
+  let pos = cap[0].length;
+  while (pos < src.length) {
+    const eol = src.indexOf('\n', pos);
+    const lineEnd = eol === -1 ? src.length : eol;
+    const line = src.slice(pos, lineEnd);
+    const term = eol === -1 ? '' : '\n';
+    pos = lineEnd + 1;
+    const info = leadInfo(line);
+    if (info.blank) {
+      pending.push(line + term);
+      continue;
+    }
+    const b = readBullet(line);
+    if (b !== null && b.indent < curW && b.ordered === ordered && b.delim === listDelim && !isHr(line)) {
+      closeItem(true);
+      const fc2 = firstContent(b.indent, b.marker, line.slice(b.end));
+      curRaw = [line + term];
+      curText = [fc2.content];
+      curW = fc2.W;
+      curHasContent = fc2.content !== '';
+      curPrevBlocks = false;
+      curPrevIsBq = false;
+      curPrevIsBull = false;
+      noteContent(fc2.content, line + term);
+      continue;
+    }
+    const out = outdent(line, info, curW);
+    if (out !== null) {
+      // Indented continuation: first settle any pending blank lines. An
+      // empty item cannot continue after a blank line; the list ends.
+      // Whether the blank group makes the list loose is decided later,
+      // from the item's re-lexed tokens, as the parent does.
+      if (pending.length > 0) {
+        if (!curHasContent) break;
+        for (let k = 0; k < pending.length; k++) {
+          curRaw.push(pending[k]);
+          curText.push('');
         }
-        else {
-            expanded += char;
-            col++;
+        pending.length = 0;
+      }
+      curRaw.push(line + term);
+      curText.push(out);
+      noteContent(out, line + term);
+      continue;
+    }
+    // Lazy candidate: indent below the content column, not a new item.
+    if (interrupts(line, htmlRe) || curPrevBlocks || !curHasContent || pending.length > 0) {
+      break;
+    }
+    let content = line;
+    if (isSetextLine(line) && !curPrevIsBq && !curPrevIsBull) content = '    ' + line;
+    curRaw.push(line + term);
+    curText.push(content);
+    noteContent(content, line + term);
+  }
+  // End of input (or of the list): close the last item, dropping trailing
+  // blank lines.
+  closeItem(false);
+  // The last item's raw and text drop trailing whitespace, and each item's
+  // text is lexed into its tokens with the lexer below top level, as the
+  // parent does (that is what makes a tight item's text a text token
+  // instead of a paragraph).
+  const last = items[items.length - 1];
+  last.raw = last.raw.trimEnd();
+  last.text = last.text.trimEnd();
+  // Loose, the parent's second way: an item whose re-lexed tokens hold a
+  // space token spanning a blank line makes the whole list loose. A blank
+  // inside a fence, a code block, or a nested list never surfaces as such
+  // a space token, so those cases are tight without any special-casing.
+  const anyLine = tok.rules.other.anyLine;
+  for (let k = 0; k < items.length; k++) {
+    tok.lexer.state.top = false;
+    items[k].tokens = tok.lexer.blockTokens(items[k].text, []);
+    if (!loose) {
+      for (let j = 0; j < items[k].tokens.length; j++) {
+        const tk = items[k].tokens[j];
+        if (tk.type === 'space' && anyLine.test(tk.raw)) { loose = true; break; }
+      }
+    }
+  }
+  for (let k = 0; k < items.length; k++) items[k].loose = loose;
+  // Task checkboxes: the parent puts a checkbox token at the front of the
+  // item's tokens (or, for a loose list, at the front of the first
+  // paragraph's inline tokens). An item whose first token is not text or
+  // a paragraph is not a task after all.
+  for (let k = 0; k < items.length; k++) {
+    const it = items[k];
+    if (!it.task) continue;
+    const first = it.tokens[0];
+    if (first && (first.type === 'text' || first.type === 'paragraph')) {
+      const m = tok.rules.other.listTaskCheckbox.exec(it.raw);
+      if (m) {
+        const cb = { type: 'checkbox', raw: m[0] + ' ', checked: m[0] !== '[ ]' };
+        it.checked = cb.checked;
+        if (loose) {
+          if (first.tokens) {
+            first.raw = cb.raw + first.raw;
+            first.text = cb.raw + first.text;
+            first.tokens.unshift(cb);
+          } else {
+            it.tokens.unshift({ type: 'paragraph', raw: cb.raw, text: cb.raw, tokens: [cb] });
+          }
+        } else {
+          it.tokens.unshift(cb);
         }
+      }
+    } else {
+      it.task = false;
     }
-    return expanded;
+  }
+  // A loose list renders each item's text as paragraphs, so its text
+  // tokens become paragraph tokens, as the parent does.
+  if (loose) {
+    for (let k = 0; k < items.length; k++) {
+      for (let j = 0; j < items[k].tokens.length; j++) {
+        if (items[k].tokens[j].type === 'text') items[k].tokens[j].type = 'paragraph';
+      }
+    }
+  }
+  let raw = '';
+  for (let k = 0; k < items.length; k++) raw += items[k].raw;
+  return { type: 'list', raw, ordered, start, loose, items };
 }
 
-// Cache a regex factory by indent, clamped to 0..3 (same scheme marked uses
-// for its own begin-regexes).
-function cachedIndentRegex(createRegex) {
-    const cache = [];
-    return (indent) => {
-        const cacheIndex = Math.max(0, Math.min(3, indent - 1));
-        let regex = cache[cacheIndex];
-        if (!regex) {
-            regex = createRegex(cacheIndex);
-            cache[cacheIndex] = regex;
-        }
-        return regex;
-    };
+// ---------- line-level helpers for the list scan ----------
+
+// Read a bullet at the start of `line` (after 0-3 spaces). Returns null
+// when the line does not start with a bullet, else {indent, marker,
+// ordered, delim, end} where end is the index just past the bullet.
+function readBullet(line) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return null;
+  const c = line.charCodeAt(i);
+  if (c === CC.star || c === CC.plus || c === CC.dash) {
+    const n = line.charCodeAt(i + 1);
+    if (n === CC.space || n === CC.tab || i + 1 === line.length) {
+      return { indent: i, marker: line[i], ordered: false, delim: line[i], end: i + 1 };
+    }
+    return null;
+  }
+  if (c >= CC.digit0 && c <= CC.digit9) {
+    let j = i;
+    while (j < line.length && j - i < 9 && line.charCodeAt(j) >= CC.digit0 && line.charCodeAt(j) <= CC.digit9) j++;
+    const d = line.charCodeAt(j);
+    if (d !== CC.dot && d !== CC.closeParen) return null;
+    const n = line.charCodeAt(j + 1);
+    if (n === CC.space || n === CC.tab || j + 1 === line.length) {
+      return { indent: i, marker: line.slice(i, j + 1), ordered: true, delim: line[j], end: j + 1 };
+    }
+  }
+  return null;
 }
 
-// Strip the `^ {0,N}` anchor from a begin-regex's .source, leaving the
-// inner pattern (which never depends on the indent).
-function stripBeginAnchor(source) {
-    return source.replace(/^\^ \{0,\d\}/, '');
+// Thematic break: only the marker (-, _ or *) and spaces/tabs, 3+ markers.
+function isHr(line) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return false;
+  const m = line.charCodeAt(i);
+  if (m !== CC.dash && m !== CC.underscore && m !== CC.star) return false;
+  let count = 0;
+  for (let j = i; j < line.length; j++) {
+    const c = line.charCodeAt(j);
+    if (c === m) count++;
+    else if (c !== CC.space && c !== CC.tab) return false;
+  }
+  return count >= 3;
 }
 
-// Combined "end of list item" regexes, built from the individual begin
-// regexes in `other` (their .source, anchor stripped, joined with `|`).
-// The result is only ever used with .test(), so inner capturing groups are
-// harmless. The whole regex carries the 'i' flag for the html alternative;
-// the other alternatives contain no letters, so it changes nothing for
-// them. (Do NOT use (?i:...) inline flags here: V8 mis-matches all-caps
-// tag names like DIV under an inline flag when the alternation is long.)
-let breakRegexes = null; // built lazily from the first list() call's rules
-function getBreakRegexes(other) {
-    if (breakRegexes) return breakRegexes;
-    const bullet = stripBeginAnchor(other.nextBulletRegex(0).source);
-    const hr = stripBeginAnchor(other.hrRegex(0).source);
-    const fences = stripBeginAnchor(other.fencesBeginRegex(0).source);
-    const heading = stripBeginAnchor(other.headingBeginRegex(0).source);
-    const pedanticHeading = stripBeginAnchor(other.pedanticHeadingBeginRegex(0).source);
-    const html = stripBeginAnchor(other.htmlBeginRegex(0).source);
-    const blockquote = stripBeginAnchor(other.blockquoteBeginRegex(0).source);
-    // Per-line test: a new bullet, hr, fence, heading, html block or
-    // blockquote ends the list item.
-    const item = (h) => cachedIndentRegex((i) => new RegExp('^ {0,' + i + '}(?:' + bullet + '|' + hr + '|' + fences + '|' + h + '|' + html + '|' + blockquote + ')', 'i'));
-    // Lazy-continuation branch: only fences, heading, html or hr end it
-    // (a bullet or blockquote does not end a paragraph here).
-    const line = (h) => cachedIndentRegex((i) => new RegExp('^ {0,' + i + '}(?:' + hr + '|' + fences + '|' + h + '|' + html + ')', 'i'));
-    breakRegexes = {
-        item: item(heading),
-        itemPedantic: item(pedanticHeading),
-        line: line(heading),
-        linePedantic: line(pedanticHeading),
-    };
-    return breakRegexes;
+// ATX heading: 1-6 '#' followed by whitespace or end of line.
+function isHeading(line) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  let n = 0;
+  while (i + n < line.length && line.charCodeAt(i + n) === CC.hash) n++;
+  if (n < 1 || n > 6) return false;
+  const after = line.charCodeAt(i + n);
+  return i + n === line.length || after === CC.space || after === CC.tab;
 }
 
-// A GFM autolink (url) can only start with www., a scheme, or an email
-// address; this is a superset of the url rule's starts, so it is safe to
-// skip the url regex when it does not match. (Without it the text regex
-// alone would wrongly swallow "www.example.com" as text.)
-const urlStartTest = /^(?:[a-zA-Z][a-zA-Z0-9+.-]{1,31}:|mailto:|xmpp:|[A-Za-z0-9._+-]+@)/;
+// A fence run at the start of `line` (0-3 spaces). Returns {ch, len, rest}
+// or null. For backticks the rest of the line must hold no backtick (the
+// info string of a ``` fence cannot contain one).
+function fenceRun(line) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return null;
+  const ch = line.charCodeAt(i);
+  if (ch !== CC.backtick && ch !== CC.tilde) return null;
+  let j = i;
+  while (j < line.length && line.charCodeAt(j) === ch) j++;
+  const len = j - i;
+  if (len < 3) return null;
+  const rest = line.slice(j);
+  if (ch === CC.backtick && rest.indexOf('`') !== -1) return null;
+  return { ch, len, rest };
+}
 
-export class OptimizedTokenizer extends Tokenizer {
-    list(src) {
-        let cap = this.rules.block.list.exec(src);
-        if (cap) {
-            // src is only consumed from the front, so every raw below is a slice of
-            // listSrc rather than a string built up line by line
-            const listSrc = src;
-            const taken = () => listSrc.length - src.length;
-            let bull = cap[1].trim();
-            const isordered = bull.length > 1;
-            const list = {
-                type: 'list',
-                raw: '',
-                ordered: isordered,
-                start: isordered ? +bull.slice(0, -1) : '',
-                loose: false,
-                items: [],
-            };
-            bull = isordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
-            if (this.options.pedantic) {
-                bull = isordered ? bull : '[*+-]';
-            }
-            // Get next list item
-            const itemRegex = this.rules.other.listItemRegex(bull);
-            let endsWithBlankLine = false;
-            // Check if current bullet point can start a new List Item
-            while (src) {
-                let endEarly = false;
-                let itemContents = '';
-                if (!(cap = itemRegex.exec(src))) {
-                    break;
-                }
-                if (this.rules.block.hr.test(src)) { // End list if bullet was actually HR (possibly move into itemRegex?)
-                    break;
-                }
-                const itemStart = taken();
-                src = src.substring(cap[0].length);
-                const firstLine = firstLineOf(cap[2]);
-                const bulletIndent = cap[1].length;
-                let line = this.options.pedantic
-                    ? expandTabs(firstLine, bulletIndent)
-                    : firstLine.replace(this.rules.other.leadingSpaceTab, whitespace => expandTabs(whitespace, bulletIndent));
-                let nextLine = firstLineOf(src);
-                let blankLine = !line.trim();
-                let indent = 0;
-                if (this.options.pedantic) {
-                    indent = 2;
-                    itemContents = line.trimStart();
-                }
-                else if (blankLine) {
-                    indent = bulletIndent + 1;
-                }
-                else {
-                    indent = line.search(this.rules.other.nonSpaceChar); // Find first non-space char
-                    indent = indent > 4 ? 1 : indent; // Treat indented code blocks (> 4 spaces) as having only 1 indent
-                    itemContents = line.slice(indent);
-                    indent += bulletIndent;
-                }
-                if (blankLine && this.rules.other.blankLine.test(nextLine)) { // Items begin with at most one blank line
-                    src = src.substring(nextLine.length + 1);
-                    endEarly = true;
-                }
-                if (!endEarly) {
-                    // One combined test replaces the six separate .test() calls
-                    // (fences, heading, html, blockquote, next bullet, hr) below,
-                    // and one for the lazy-continuation branch (no bullet/blockquote).
-                    const breaks = getBreakRegexes(this.rules.other);
-                    const itemBreakRegex = this.options.pedantic
-                        ? breaks.itemPedantic(indent)
-                        : breaks.item(indent);
-                    const lineBreakRegex = this.options.pedantic
-                        ? breaks.linePedantic(indent)
-                        : breaks.line(indent);
-                    // Check if following lines should be included in List Item
-                    while (src) {
-                        const rawLine = firstLineOf(src);
-                        let nextLineWithoutTabs;
-                        nextLine = rawLine;
-                        // Re-align to follow commonmark nesting rules
-                        if (this.options.pedantic) {
-                            nextLine = nextLine.replace(this.rules.other.listReplaceNesting, '  ');
-                            nextLineWithoutTabs = nextLine;
-                        }
-                        else {
-                            nextLineWithoutTabs = nextLine.replace(this.rules.other.leadingSpaceTab, whitespace => expandTabs(whitespace));
-                        }
-                        // End list item if the next line starts a new block
-                        // (fence, heading, html, blockquote, bullet, hr).
-                        if (itemBreakRegex.test(nextLine)) {
-                            break;
-                        }
-                        // First non-space char of the tab-expanded line; -1 when blank.
-                        // (Leading tabs were expanded above, so -1 means all whitespace.)
-                        const firstNonSpace = nextLineWithoutTabs.search(this.rules.other.nonSpaceChar);
-                        if (firstNonSpace >= indent || firstNonSpace === -1) { // Dedent if possible
-                            itemContents += '\n' + nextLineWithoutTabs.slice(indent);
-                        }
-                        else {
-                            // not enough indentation
-                            if (blankLine) {
-                                break;
-                            }
-                            // paragraph continuation unless last line was a different block level element
-                            // (line has no leading tabs: they were expanded when it was built,
-                            // so the tab replace the original did here cannot move the search)
-                            if (line.search(this.rules.other.nonSpaceChar) >= 4) { // indented code block
-                                break;
-                            }
-                            if (lineBreakRegex.test(line)) {
-                                break;
-                            }
-                            // A lazy continuation can look like a setext underline after
-                            // list indentation is removed. Keep it in the paragraph.
-                            const setextContinuation = !this.options.pedantic
-                                && /^ {0,3}(?:=+|-+) *$/.test(nextLine)
-                                && this.rules.block.lheading.test(`${line}\n${nextLine}`);
-                            const continuation = setextContinuation
-                                ? `    ${nextLineWithoutTabs.replace(/^ {0,3}/, '')}`
-                                : nextLine;
-                            itemContents += '\n' + continuation;
-                        }
-                        blankLine = firstNonSpace === -1;
-                        src = src.substring(rawLine.length + 1);
-                        line = nextLineWithoutTabs.slice(indent);
-                    }
-                }
-                // The loops above appended a '\n' the source may not have had. It could
-                // only land on the item that exhausts src, whose raw is trimmed below,
-                // and after which nothing reads endsWithBlankLine
-                const raw = listSrc.slice(itemStart, taken());
-                if (!list.loose) {
-                    // If the previous item ended with a blank line, the list is loose
-                    if (endsWithBlankLine) {
-                        list.loose = true;
-                    }
-                    else if (this.rules.other.doubleBlankLine.test(raw)) {
-                        endsWithBlankLine = true;
-                    }
-                }
-                list.items.push({
-                    type: 'list_item',
-                    raw,
-                    task: !!this.options.gfm && this.rules.other.listIsTask.test(itemContents),
-                    loose: false,
-                    text: itemContents,
-                    tokens: [],
-                });
-            }
-            // Do not consume newlines at end of final item. Alternatively, make itemRegex *start* with any newlines to simplify/speed up endsWithBlankLine logic
-            const lastItem = list.items.at(-1);
-            if (lastItem) {
-                lastItem.raw = lastItem.raw.trimEnd();
-                lastItem.text = lastItem.text.trimEnd();
-            }
-            else {
-                // not a list since there were no items
-                return;
-            }
-            list.raw = listSrc.slice(0, taken()).trimEnd();
-            // Item child tokens handled here at end because we needed to have the final item to trim it first
-            // First pass: tokenize items and finalize list.loose from spacers before placing checkboxes
-            for (const item of list.items) {
-                this.lexer.state.top = false;
-                item.tokens = this.lexer.blockTokens(item.text, []);
-                if (!list.loose) {
-                    // Check if list should be loose
-                    const spacers = item.tokens.filter(t => t.type === 'space');
-                    const hasMultipleLineBreaks = spacers.length > 0 && spacers.some(t => this.rules.other.anyLine.test(t.raw));
-                    list.loose = hasMultipleLineBreaks;
-                }
-            }
-            // Second pass: place task checkboxes using the final list.loose
-            for (const item of list.items) {
-                const itemToken = item.tokens[0];
-                if (item.task && (itemToken?.type === 'text' || itemToken?.type === 'paragraph')) {
-                    // Remove checkbox markdown from item tokens
-                    item.text = item.text.replace(this.rules.other.listReplaceTask, '');
-                    itemToken.raw = itemToken.raw.replace(this.rules.other.listReplaceTask, '');
-                    itemToken.text = itemToken.text.replace(this.rules.other.listReplaceTask, '');
-                    for (let i = this.lexer.inlineQueue.length - 1; i >= 0; i--) {
-                        if (this.rules.other.listIsTask.test(this.lexer.inlineQueue[i].src)) {
-                            this.lexer.inlineQueue[i].src = this.lexer.inlineQueue[i].src.replace(this.rules.other.listReplaceTask, '');
-                            break;
-                        }
-                    }
-                    const taskRaw = this.rules.other.listTaskCheckbox.exec(item.raw);
-                    if (taskRaw) {
-                        const checkboxToken = {
-                            type: 'checkbox',
-                            raw: taskRaw[0] + ' ',
-                            checked: taskRaw[0] !== '[ ]',
-                        };
-                        item.checked = checkboxToken.checked;
-                        if (list.loose) {
-                            if (item.tokens[0] && ['paragraph', 'text'].includes(item.tokens[0].type) && 'tokens' in item.tokens[0] && item.tokens[0].tokens) {
-                                item.tokens[0].raw = checkboxToken.raw + item.tokens[0].raw;
-                                item.tokens[0].text = checkboxToken.raw + item.tokens[0].text;
-                                item.tokens[0].tokens.unshift(checkboxToken);
-                            }
-                            else {
-                                item.tokens.unshift({
-                                    type: 'paragraph',
-                                    raw: checkboxToken.raw,
-                                    text: checkboxToken.raw,
-                                    tokens: [checkboxToken],
-                                });
-                            }
-                        }
-                        else {
-                            item.tokens.unshift(checkboxToken);
-                        }
-                    }
-                }
-                else if (item.task) {
-                    item.task = false;
-                }
-            }
-            // Set all items to loose if list is loose
-            if (list.loose) {
-                for (const item of list.items) {
-                    item.loose = true;
-                    for (const token of item.tokens) {
-                        if (token.type === 'text') {
-                            token.type = 'paragraph';
-                        }
-                    }
-                }
-            }
-            return list;
-        }
-    }
+// Does this line start a block that interrupts a paragraph (and so ends
+// lazy continuation of a list item)? hr, ATX heading, blockquote, fence,
+// any list bullet, or an HTML block start.
+function interrupts(line, htmlRe) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return false;
+  const c = line.charCodeAt(i);
+  if (c === CC.gt) return true;
+  if (c === CC.hash) return isHeading(line);
+  if (c === CC.backtick || c === CC.tilde) return fenceRun(line) !== null;
+  if (c === CC.lt) return htmlRe.test(line);
+  if (c === CC.dash || c === CC.underscore || c === CC.star) return isHr(line) || readBullet(line) !== null;
+  if (c === CC.plus) return readBullet(line) !== null;
+  if (c >= CC.digit0 && c <= CC.digit9) return readBullet(line) !== null;
+  return false;
+}
 
-    // --- Inline methods: first-character guards --------------------------
-    // Each rule's regex is ^-anchored and needs a specific trigger char.
-    // When the first char cannot match, the method would return undefined
-    // anyway, so return early without running the regex.
+// Does the previous raw line close the item for lazy lines? A heading, a
+// fence line, a thematic break, or an HTML block start does; blockquotes,
+// nested lists, code and plain text do not.
+function blocksLazy(line, htmlRe) {
+  let i = 0;
+  while (i < line.length && i < MAX_LEAD && line.charCodeAt(i) === CC.space) i++;
+  if (i >= line.length) return false;
+  const c = line.charCodeAt(i);
+  if (c === CC.hash) return isHeading(line);
+  if (c === CC.backtick || c === CC.tilde) return fenceRun(line) !== null;
+  if (c === CC.lt) return htmlRe.test(line);
+  if (c === CC.dash || c === CC.underscore || c === CC.star) return isHr(line);
+  return false;
+}
 
-    escape(src) {
-        if (src.charCodeAt(0) !== 92) return undefined; // backslash
-        return super.escape(src);
-    }
+// Given a bullet line's pieces, work out the item's content indent W (an
+// absolute column) and the first line's content text. Tabs advance to the
+// next multiple of 4. When the gap after the bullet is 1-4 columns the
+// content starts after it; with 5 or more columns the content indent is
+// bullet width + 1 and the extra spaces stay in the content.
+function firstContent(bulletIndent, bullet, after) {
+  const base = bulletIndent + bullet.length;
+  let col = base;
+  let k = 0;
+  while (k < after.length) {
+    const c = after.charCodeAt(k);
+    if (c === CC.space) { col++; k++; }
+    else if (c === CC.tab) { col += 4 - (col % 4); k++; }
+    else break;
+  }
+  const rest = after.slice(k);
+  if (rest.length === 0) return { W: base + 1, content: '' };
+  const gap = col - base;
+  if (gap >= 5) return { W: base + 1, content: ' '.repeat(gap - 1) + rest };
+  return { W: col, content: rest };
+}
 
-    tag(src) {
-        if (src.charCodeAt(0) !== 60) return undefined; // <
-        return super.tag(src);
-    }
+// Scan a line's leading whitespace: blank means the line holds only spaces
+// and tabs, col is the tab-expanded column of the first other character,
+// and at is its index.
+function leadInfo(line) {
+  let col = 0;
+  let i = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c === CC.space) { col++; i++; }
+    else if (c === CC.tab) { col += 4 - (col % 4); i++; }
+    else break;
+  }
+  return { blank: i === line.length, col, at: i };
+}
 
-    link(src) {
-        const c0 = src.charCodeAt(0);
-        if (c0 !== 91 && c0 !== 33) return undefined; // [ or ! (image)
-        return super.link(src);
-    }
-
-    reflink(src, links) {
-        const c0 = src.charCodeAt(0);
-        if (c0 !== 91 && c0 !== 33) return undefined; // [ or ! (image)
-        return super.reflink(src, links);
-    }
-
-    emStrong(src, maskedSrc, prevChar = '') {
-        const c0 = src.charCodeAt(0);
-        if (c0 !== 42 && c0 !== 95) return undefined; // * or _
-        return super.emStrong(src, maskedSrc, prevChar);
-    }
-
-    codespan(src) {
-        if (src.charCodeAt(0) !== 96) return undefined; // backtick
-        return super.codespan(src);
-    }
-
-    br(src) {
-        const c0 = src.charCodeAt(0);
-        if (c0 !== 32 && c0 !== 92) return undefined; // space or backslash
-        return super.br(src);
-    }
-
-    del(src, maskedSrc, prevChar = '') {
-        if (src.charCodeAt(0) !== 126) return undefined; // ~
-        return super.del(src, maskedSrc, prevChar);
-    }
-
-    autolink(src) {
-        if (src.charCodeAt(0) !== 60) return undefined; // <
-        return super.autolink(src);
-    }
-
-    url(src) {
-        if (!src.startsWith('www.') && !urlStartTest.test(src)) return undefined;
-        return super.url(src);
-    }
+// Remove W columns from a line whose leading whitespace expands to `col`
+// columns (from leadInfo). The remainder of the leading whitespace stays.
+function outdent(line, info, W) {
+  if (info.col < W) return null;
+  return ' '.repeat(info.col - W) + line.slice(info.at);
 }
