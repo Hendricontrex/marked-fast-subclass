@@ -1,14 +1,16 @@
 // A faster drop-in for marked 18.1.3: the same HTML, rendered through
 // marked's own Lexer and Parser, but with a fast list tokenizer and
 // first-character guards on the inline rules (see
-// src/OptimizedTokenizer.js), and one lexer/parser pair reused across
-// calls instead of built fresh for every document.
+// src/OptimizedTokenizer.js), first-character dispatch in the block and
+// inline loops (see src/FastLexer.js), and one lexer/parser pair reused
+// across calls instead of built fresh for every document.
 
-import { Lexer, Parser, getDefaults } from './vendor/marked/marked.esm.js';
+import { Parser, getDefaults } from './vendor/marked/marked.esm.js';
 import { FastTokenizer } from './src/OptimizedTokenizer.js';
+import { FastLexer } from './src/FastLexer.js';
 
 const baseOptions = getDefaults();
-const lexer = new Lexer({ ...baseOptions, tokenizer: new FastTokenizer() });
+const lexer = new FastLexer({ ...baseOptions, tokenizer: new FastTokenizer() });
 const parser = new Parser({ ...baseOptions });
 const lexState = lexer.state;
 
