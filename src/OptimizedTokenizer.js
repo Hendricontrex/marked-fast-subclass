@@ -46,6 +46,12 @@ function canStartBlock(c) {
 // item text is built with plain string appends.
 export class FastTokenizer extends Tokenizer {
   list(src) {
+    // A list item starts with up to 3 spaces and then -, *, + or a digit.
+    const c0 = src.charCodeAt(0);
+    if (
+      c0 !== 32 && c0 !== 45 && c0 !== 42 && c0 !== 43 &&
+      (c0 < 48 || c0 > 57)
+    ) return;
     const head = this.rules.block.list.exec(src);
     if (!head) return;
     const other = this.rules.other;
@@ -255,6 +261,82 @@ export class FastTokenizer extends Tokenizer {
       }
     }
     return out;
+  }
+
+  // Block rules below: same idea as the inline guards. The block lexer
+  // tries these in order before falling back to a paragraph, so for an
+  // ordinary paragraph most of them would run a regex that cannot match.
+  // Each guard is exact: the rule's regex starts with at most 3 spaces
+  // and then one fixed starter character, so any other first character
+  // rules it out.
+  space(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 10 && c !== 32 && c !== 9) return; // \n, space or tab
+    return super.space(src);
+  }
+
+  code(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 9) return; // 4 spaces or a tab
+    return super.code(src);
+  }
+
+  fences(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 96 && c !== 126) return; // space, ` or ~
+    return super.fences(src);
+  }
+
+  heading(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 35) return; // space or #
+    return super.heading(src);
+  }
+
+  hr(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 45 && c !== 95 && c !== 42) return; // space, -, _ or *
+    return super.hr(src);
+  }
+
+  blockquote(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 62) return; // space or >
+    return super.blockquote(src);
+  }
+
+  html(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 60) return; // space or <
+    return super.html(src);
+  }
+
+  def(src) {
+    const c = src.charCodeAt(0);
+    if (c !== 32 && c !== 91) return; // space or [
+    return super.def(src);
+  }
+
+  table(src) {
+    // A table needs a header line followed at once by a delimiter line
+    // (--- / :---: / | --- | ...). If the second line is not a delimiter,
+    // the table regex cannot match.
+    const nl = src.indexOf('\n');
+    if (nl === -1) return;
+    const line2End = src.indexOf('\n', nl + 1);
+    const line2 = line2End === -1 ? src.slice(nl + 1) : src.slice(nl + 1, line2End);
+    if (!/^ {0,3}(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/.test(line2)) return;
+    return super.table(src);
+  }
+
+  lheading(src) {
+    // A setext heading needs an underline line (= or -) before the next
+    // blank line: the heading text cannot cross one. If no such underline
+    // occurs there, the heading regex cannot match.
+    const blankAt = src.indexOf('\n\n');
+    const head = blankAt === -1 ? src : src.slice(0, blankAt);
+    if (!/\n {0,3}[=-]/.test(head)) return;
+    return super.lheading(src);
   }
 
   // Inline rules below: each one bails out fast when the first character
